@@ -2,7 +2,6 @@
 #include "esp_camera.h"
 #include "FS.h"
 #include "SD_MMC.h"
-#include "SD.h"
 #include <driver/i2s.h>
 #include <TinyGPS++.h>
 #include <HardwareSerial.h>
@@ -35,11 +34,10 @@
 #define I2S_SCK  14
 #define GPS_RX   13
 #define GPS_TX   12
-#define SD_CS    5
 
-const char* ssid = "PLDTHOMEFIBRUXH9p";
-const char* password = "PLDTWIFI3VNXq";
-const char* FLASK_URL = "http://192.168.1.49:5000";
+const char* ssid = "MONTEROWIFI";
+const char* password = "titan123";
+const char* FLASK_URL = "http://192.168.0.189:5000";
 const int patientId = 1;
 const uint64_t maxVideoSize = 700ULL * 1024 * 1024;
 
@@ -47,7 +45,11 @@ HardwareSerial gpsSerial(2);
 TinyGPSPlus gps;
 fs::FS* fsUsed = nullptr;
 
-// ==== INIT ====
+struct Location {
+  double lat = 0.0;
+  double lon = 0.0;
+  bool isValid = false;
+};
 
 void initWiFi() {
   WiFi.begin(ssid, password);
@@ -64,26 +66,38 @@ void initGPS() {
   Serial.println("✅ GPS initialized");
 }
 
+void ensureAudioFolderExists() {
+  if (!fsUsed) return;
+  if (!fsUsed->exists("/audiofiles")) {
+    Serial.println("📁 /audiofiles missing, creating...");
+    if (fsUsed->mkdir("/audiofiles")) {
+      Serial.println("✅ /audiofiles created");
+    } else {
+      Serial.println("❌ Failed to create /audiofiles");
+    }
+  }
+}
+
 void initSDCard() {
   Serial.println("[SD] Trying SD_MMC (4-bit)");
-  if (SD_MMC.begin("/sdcard", false)) { // 4-bit mode
+  if (SD_MMC.begin("/sdcard", false)) {
     fsUsed = &SD_MMC;
     Serial.println("[SD] SD_MMC mounted (4-bit mode)");
-
     uint64_t cardSize = SD_MMC.cardSize() / (1024 * 1024);
     Serial.printf("[SD] Card size: %llu MB\n", cardSize);
+    ensureAudioFolderExists();
 
-    uint8_t cardType = SD_MMC.cardType();
-    if (cardType == CARD_NONE) {
-      Serial.println("[SD] No SD card detected");
+    File test = fsUsed->open("/audiofiles/test.txt", FILE_WRITE);
+    if (test) {
+      test.println("SD write test OK");
+      test.close();
+      Serial.println("✅ Wrote test file to /audiofiles/test.txt");
     } else {
-      Serial.printf("[SD] Card type: %d\n", cardType);
+      Serial.println("❌ Failed to write test file");
     }
-
     return;
   }
-
-  Serial.println("[SD] SD_MMC failed");
+  Serial.println("❌ [SD] SD_MMC failed");
 }
 
 void initI2SMic() {
@@ -144,14 +158,24 @@ void initCamera() {
   Serial.println("✅ Camera initialized");
 }
 
-// ==== AUDIO ====
+void recordWav(const char* filepath, int seconds = 7) {
+  if (!fsUsed) {
+    Serial.println("❌ SD not initialized. Skipping WAV recording.");
+    return;
+  }
 
-void recordWav(const char* filename, int seconds = 7) {
-  if (!fsUsed) return;
+  ensureAudioFolderExists();
+
+  Serial.printf("🎙️ Recording WAV: %s (%d seconds)\n", filepath, seconds);
+
   const int sample_rate = 16000;
   const int num_samples = sample_rate * seconds;
-  File file = fsUsed->open(filename, FILE_WRITE);
-  if (!file) return;
+
+  File file = fsUsed->open(filepath, FILE_WRITE);
+  if (!file) {
+    Serial.printf("❌ Failed to open file for writing: %s\n", filepath);
+    return;
+  }
 
   for (int i = 0; i < 44; i++) file.write((uint8_t)0);
 
@@ -183,20 +207,29 @@ void recordWav(const char* filename, int seconds = 7) {
   file.write((const uint8_t*)"data", 4);
   file.write((uint8_t*)&bytes_written, 4);
   file.close();
-  delay(100); // wait before next read/write
+  delay(100);
 
+  if (fsUsed->exists(filepath)) {
+    Serial.printf("✅ WAV saved to SD: %s (%u bytes)\n", filepath, bytes_written);
+  } else {
+    Serial.printf("❌ File %s missing after write!\n", filepath);
+  }
 }
-
-// ==== CLOUD ====
 
 String getPresignedUrl(String& outKey) {
   HTTPClient http;
   http.begin(String(FLASK_URL) + "/generate-url");
   int httpCode = http.GET();
-  if (httpCode != 200) return "";
   String payload = http.getString();
+  Serial.printf("🌐 Flask GET /generate-url code: %d\n", httpCode);
+  Serial.println("📨 Payload: " + payload);
+  if (httpCode != 200) return "";
+
   StaticJsonDocument<1024> doc;
-  if (deserializeJson(doc, payload)) return "";
+  if (deserializeJson(doc, payload)) {
+    Serial.println("❌ Failed to parse JSON response.");
+    return "";
+  }
   outKey = String((const char*)doc["key"]);
   String url = doc["url"];
   url.replace("\\u0026", "&");
@@ -206,100 +239,148 @@ String getPresignedUrl(String& outKey) {
 bool uploadWavToS3(const char* localPath, String& uploadedKey) {
   if (!fsUsed) return false;
   uploadedKey = "";
+  Serial.println("🌐 Fetching presigned URL...");
   String presignedUrl = getPresignedUrl(uploadedKey);
-  if (presignedUrl == "") return false;
+  if (presignedUrl == "") {
+    Serial.println("❌ Failed to get presigned URL.");
+    return false;
+  }
+
   File file = fsUsed->open(localPath);
-  if (!file) return false;
+  if (!file) {
+    Serial.println("❌ File not found on SD.");
+    return false;
+  }
   int size = file.size();
   uint8_t* buffer = (uint8_t*)malloc(size);
-  if (!buffer) {file.close(); return false; }
+  if (!buffer) {
+    Serial.println("❌ Memory allocation failed.");
+    file.close();
+    return false;
+  }
   file.read(buffer, size);
   file.close();
-  delay(100); // wait before next read/write
+  delay(100);
+
   HTTPClient http;
   http.begin(presignedUrl);
   http.addHeader("Content-Type", "audio/wav");
   int code = http.PUT(buffer, size);
   http.end();
   free(buffer);
+
+  Serial.printf("📡 Upload HTTP code: %d\n", code);
+
   if (code == 200 && fsUsed->exists(localPath)) {
     fsUsed->remove(localPath);
     Serial.println("🗑️ Audio deleted from SD after upload");
-  } else Serial.println("⚠️ Upload failed, audio not deleted");
+  } else Serial.println("⚠️ Upload failed or file not deleted");
+
   return (code == 200);
 }
 
+Location getLocationFromIP() {
+  Location loc;
+  HTTPClient http;
+  http.begin("http://ip-api.com/json");
+  int httpCode = http.GET();
+  if (httpCode == 200) {
+    String payload = http.getString();
+    StaticJsonDocument<1024> doc;
+    if (deserializeJson(doc, payload) == DeserializationError::Ok) {
+      loc.lat = doc["lat"];
+      loc.lon = doc["lon"];
+      loc.isValid = true;
+    }
+  }
+  http.end();
+  return loc;
+}
+
 void notifyBackend(String key) {
-  if (!gps.location.isValid()) return;
+  double lat = 0.0, lon = 0.0;
+  bool hasGPS = gps.location.isValid();
+
+  if (hasGPS) {
+    lat = gps.location.lat();
+    lon = gps.location.lng();
+    Serial.printf("📡 GPS Location: %.6f, %.6f\n", lat, lon);
+  } else {
+    Serial.println("⚠️ GPS invalid. Trying IP-based location...");
+    Location ipLoc = getLocationFromIP();
+    if (!ipLoc.isValid) {
+      Serial.println("❌ No valid location available");
+      return;
+    }
+    lat = ipLoc.lat;
+    lon = ipLoc.lon;
+    Serial.printf("🌐 IP Location: %.6f, %.6f\n", lat, lon);
+  }
+
   HTTPClient http;
   http.begin(String(FLASK_URL) + "/audio-meta");
   http.addHeader("Content-Type", "application/json");
-  String body = "{\"key\":\"" + key + "\",\"lat\":" + String(gps.location.lat(), 6) + ",\"lon\":" + String(gps.location.lng(), 6) + ",\"patientId\":" + String(patientId) + "}";
+  String body = "{\"key\":\"" + key + "\",\"lat\":" + String(lat, 6) + ",\"lon\":" + String(lon, 6) + ",\"patientId\":" + String(patientId) + "}";
+  Serial.println("📨 Notifying backend with:");
+  Serial.println(body);
   http.POST(body);
   http.end();
 }
-
-// ==== OFFLINE ====
-
-uint64_t getSDCardUsedBytes() {
-  if (!fsUsed) return 0;
-  uint64_t total = 0;
-  File root = fsUsed->open("/");
-  File file;
-  while ((file = root.openNextFile())) {
-    total += file.size();
-    file.close();
-    delay(100); // wait before next read/write
-  }
-  return total;
-}
-
-void recordOfflineVideoAudio() {
-  if (!fsUsed) return;
-  Serial.println("📼 Offline: Recording video + audio to SD");
-  char filename[32];
-  int fileIndex = 0;
-  while (WiFi.status() != WL_CONNECTED && getSDCardUsedBytes() < maxVideoSize) {
-    snprintf(filename, sizeof(filename), "/offline_%d.jpg", fileIndex);
-    camera_fb_t* fb = esp_camera_fb_get();
-    if (fb) {
-      File pic = fsUsed->open(filename, FILE_WRITE);
-      if (pic) {
-        pic.write(fb->buf, fb->len);
-        pic.close();
-      }
-      esp_camera_fb_return(fb);
-    }
-    snprintf(filename, sizeof(filename), "/offline_%d.wav", fileIndex);
-    recordWav(filename, 7);
-    fileIndex++;
-    delay(1000);
-  }
-  Serial.println("🛑 Offline recording done.");
-}
-
-// ==== SETUP & LOOP ====
 
 void setup() {
   Serial.begin(115200);
   delay(1000);
   initWiFi();
   initGPS();
+  delay(500);
   initSDCard();
   initI2SMic();
   initCamera();
+  pinMode(4, OUTPUT);
+  digitalWrite(4, LOW); // Turn off camera flash
 }
 
 void loop() {
-  while (gpsSerial.available()) gps.encode(gpsSerial.read());
-  if (WiFi.status() == WL_CONNECTED && fsUsed) {
-    recordWav("/audio.wav", 7);
-    String key;
-    if (uploadWavToS3("/audio.wav", key)) notifyBackend(key);
-  } else {
-    recordOfflineVideoAudio();
-    delay(5000);
-    initWiFi();
-  }
-}
+  static unsigned long lastLocationLog = 0;
+  static Location lastKnownLoc;
 
+  while (gpsSerial.available()) gps.encode(gpsSerial.read());
+
+  if (millis() - lastLocationLog >= 1000) {
+    lastLocationLog = millis();
+    if (gps.location.isValid()) {
+      lastKnownLoc.lat = gps.location.lat();
+      lastKnownLoc.lon = gps.location.lng();
+      lastKnownLoc.isValid = true;
+      Serial.printf("📡 [GPS] %.6f, %.6f\n", lastKnownLoc.lat, lastKnownLoc.lon);
+    } else {
+      Serial.println("🌐 [IP] GPS invalid, using IP location...");
+      Location ipLoc = getLocationFromIP();
+      if (ipLoc.isValid) {
+        lastKnownLoc = ipLoc;
+        Serial.printf("🌐 [IP] %.6f, %.6f\n", ipLoc.lat, ipLoc.lon);
+      } else {
+        Serial.println("❌ [Location] IP-based location failed");
+      }
+    }
+  }
+
+  const char* filepath = "/audiofiles/audio.wav";
+
+  if (WiFi.status() == WL_CONNECTED && fsUsed) {
+    Serial.println("🌐 Online: Starting audio recording...");
+    recordWav(filepath, 7);
+    Serial.println("📤 Attempting to upload recorded audio...");
+    String key;
+    if (uploadWavToS3(filepath, key)) {
+      Serial.println("✅ Upload success. Notifying backend...");
+      notifyBackend(key);
+    } else {
+      Serial.println("❌ Upload failed. Skipping backend notification.");
+    }
+  } else {
+    Serial.println("📴 WiFi not connected. Skipping online mode.");
+  }
+
+  delay(10000);
+}
